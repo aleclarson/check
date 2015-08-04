@@ -1,0 +1,11 @@
+{
+  "name": "check",
+  "description": "Check whether a value matches a pattern",
+  "version": "1.0.6",
+  "dependencies": {
+    "ejson": "aleclarson/ejson#1.0.7",
+    "json": "aleclarson/json#1.0.4",
+    "meteor-client": "aleclarson/meteor-client#1.1.7",
+    "underscore": "aleclarson/underscore#1.5.2"
+  }
+}
