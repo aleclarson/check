@@ -1,47 +1,14 @@
-// XXX docs
 
-// Things we explicitly do NOT support:
-//    - heterogenous arrays
-
-var currentArgumentChecker = new Meteor.EnvironmentVariable;
-
-/**
- * @summary Check that a value matches a [pattern](#matchpatterns).
- * If the value does not match the pattern, throw a `Match.Error`.
- *
- * Particularly useful to assert that arguments to a function have the right
- * types and structure.
- * @locus Anywhere
- * @param {Any} value The value to check
- * @param {MatchPattern} pattern The pattern to match
- * `value` against
- */
-check = function (value, pattern) {
-  // Record that check got called, if somebody cared.
-  //
-  // We use getOrNullIfOutsideFiber so that it's OK to call check()
-  // from non-Fiber server contexts; the downside is that if you forget to
-  // bindEnvironment on some random callback in your method/publisher,
-  // it might not find the argumentChecker and you'll get an error about
-  // not checking an argument that it looks like you're checking (instead
-  // of just getting a "Node code must run in a Fiber" error).
-  var argChecker = currentArgumentChecker.getOrNullIfOutsideFiber();
-  if (argChecker)
-    argChecker.checking(value);
-  try {
-    checkSubtree(value, pattern);
-  } catch (err) {
-    if ((err instanceof Match.Error) && err.path)
-      err.message += " in field " + err.path;
-    throw err;
-  }
-};
+var Meteor = require('meteor-client');
+var EJSON = require('ejson');
+var JSON = require('json');
+var _ = require('underscore');
 
 /**
  * @namespace Match
  * @summary The namespace for all Match types and methods.
  */
-Match = {
+var Match = {
   Optional: function (pattern) {
     return new Optional(pattern);
   },
@@ -89,7 +56,7 @@ Match = {
    */
   test: function (value, pattern) {
     try {
-      checkSubtree(value, pattern);
+      Match._checkSubtree(value, pattern);
       return true;
     } catch (e) {
       if (e instanceof Match.Error)
@@ -98,6 +65,8 @@ Match = {
       throw e;
     }
   },
+
+  _currentArgumentChecker: new Meteor.EnvironmentVariable,
 
   // Runs `f.apply(context, args)`. If check() is not called on every element of
   // `args` (either directly or in the first level of an array), throws an error
@@ -111,6 +80,174 @@ Match = {
     // If f didn't itself throw, make sure it checked all of its arguments.
     argChecker.throwUnlessAllArgumentsHaveBeenChecked();
     return result;
+  },
+
+  _checkSubtree: function (value, pattern) {
+    // Match anything!
+    if (pattern === Match.Any)
+      return;
+
+    // Basic atomic types.
+    // Do not match boxed objects (e.g. String, Boolean)
+    for (var i = 0; i < typeofChecks.length; ++i) {
+      if (pattern === typeofChecks[i][0]) {
+        if (typeof value === typeofChecks[i][1])
+          return;
+        throw new Match.Error("Expected " + typeofChecks[i][1] + ", got " +
+                              typeof value);
+      }
+    }
+    if (pattern === null) {
+      if (value === null)
+        return;
+      throw new Match.Error("Expected null, got " + EJSON.stringify(value));
+    }
+
+    // Strings, numbers, and booleans match literally. Goes well with Match.OneOf.
+    if (typeof pattern === "string" || typeof pattern === "number" || typeof pattern === "boolean") {
+      if (value === pattern)
+        return;
+      throw new Match.Error("Expected " + pattern + ", got " +
+                            EJSON.stringify(value));
+    }
+
+    // Match.Integer is special type encoded with array
+    if (pattern === Match.Integer) {
+      // There is no consistent and reliable way to check if variable is a 64-bit
+      // integer. One of the popular solutions is to get reminder of division by 1
+      // but this method fails on really large floats with big precision.
+      // E.g.: 1.348192308491824e+23 % 1 === 0 in V8
+      // Bitwise operators work consistantly but always cast variable to 32-bit
+      // signed integer according to JavaScript specs.
+      if (typeof value === "number" && (value | 0) === value)
+        return
+      throw new Match.Error("Expected Integer, got "
+                  + (value instanceof Object ? EJSON.stringify(value) : value));
+    }
+
+    // "Object" is shorthand for Match.ObjectIncluding({});
+    if (pattern === Object)
+      pattern = Match.ObjectIncluding({});
+
+    // Array (checked AFTER Any, which is implemented as an Array).
+    if (pattern instanceof Array) {
+      if (pattern.length !== 1)
+        throw Error("Bad pattern: arrays must have one type element" +
+                    EJSON.stringify(pattern));
+      if (!_.isArray(value) && !_.isArguments(value)) {
+        throw new Match.Error("Expected array, got " + EJSON.stringify(value));
+      }
+
+      _.each(value, function (valueElement, index) {
+        try {
+          Match._checkSubtree(valueElement, pattern[0]);
+        } catch (err) {
+          if (err instanceof Match.Error) {
+            err.path = _prependPath(index, err.path);
+          }
+          throw err;
+        }
+      });
+      return;
+    }
+
+    // Arbitrary validation checks. The condition can return false or throw a
+    // Match.Error (ie, it can internally use check()) to fail.
+    if (pattern instanceof Where) {
+      if (pattern.condition(value))
+        return;
+      // XXX this error is terrible
+      throw new Match.Error("Failed Match.Where validation");
+    }
+
+
+    if (pattern instanceof Optional)
+      pattern = Match.OneOf(undefined, pattern.pattern);
+
+    if (pattern instanceof OneOf) {
+      for (var i = 0; i < pattern.choices.length; ++i) {
+        try {
+          Match._checkSubtree(value, pattern.choices[i]);
+          // No error? Yay, return.
+          return;
+        } catch (err) {
+          // Other errors should be thrown. Match errors just mean try another
+          // choice.
+          if (!(err instanceof Match.Error))
+            throw err;
+        }
+      }
+      // XXX this error is terrible
+      throw new Match.Error("Failed Match.OneOf or Match.Optional validation");
+    }
+
+    // A function that isn't something we special-case is assumed to be a
+    // constructor.
+    if (pattern instanceof Function) {
+      if (value instanceof pattern)
+        return;
+      throw new Match.Error("Expected " + (pattern.name ||
+                                           "particular constructor"));
+    }
+
+    var unknownKeysAllowed = false;
+    var unknownKeyPattern;
+    if (pattern instanceof ObjectIncluding) {
+      unknownKeysAllowed = true;
+      pattern = pattern.pattern;
+    }
+    if (pattern instanceof ObjectWithValues) {
+      unknownKeysAllowed = true;
+      unknownKeyPattern = [pattern.pattern];
+      pattern = {};  // no required keys
+    }
+
+    if (typeof pattern !== "object")
+      throw Error("Bad pattern: unknown pattern type");
+
+    // An object, with required and optional keys. Note that this does NOT do
+    // structural matches against objects of special types that happen to match
+    // the pattern: this really needs to be a plain old {Object}!
+    if (typeof value !== 'object')
+      throw new Match.Error("Expected object, got " + typeof value);
+    if (value === null)
+      throw new Match.Error("Expected object, got null");
+    if (value.constructor !== Object)
+      throw new Match.Error("Expected plain object");
+
+    var requiredPatterns = {};
+    var optionalPatterns = {};
+    _.each(pattern, function (subPattern, key) {
+      if (subPattern instanceof Optional)
+        optionalPatterns[key] = subPattern.pattern;
+      else
+        requiredPatterns[key] = subPattern;
+    });
+
+    _.each(value, function (subValue, key) {
+      try {
+        if (_.has(requiredPatterns, key)) {
+          Match._checkSubtree(subValue, requiredPatterns[key]);
+          delete requiredPatterns[key];
+        } else if (_.has(optionalPatterns, key)) {
+          Match._checkSubtree(subValue, optionalPatterns[key]);
+        } else {
+          if (!unknownKeysAllowed)
+            throw new Match.Error("Unknown key");
+          if (unknownKeyPattern) {
+            Match._checkSubtree(subValue, unknownKeyPattern[0]);
+          }
+        }
+      } catch (err) {
+        if (err instanceof Match.Error)
+          err.path = _prependPath(key, err.path);
+        throw err;
+      }
+    });
+
+    _.each(requiredPatterns, function (subPattern, key) {
+      throw new Match.Error("Missing key '" + key + "'");
+    });
   }
 };
 
@@ -144,174 +281,6 @@ var typeofChecks = [
   // arguments with OneOf.
   [undefined, "undefined"]
 ];
-
-var checkSubtree = function (value, pattern) {
-  // Match anything!
-  if (pattern === Match.Any)
-    return;
-
-  // Basic atomic types.
-  // Do not match boxed objects (e.g. String, Boolean)
-  for (var i = 0; i < typeofChecks.length; ++i) {
-    if (pattern === typeofChecks[i][0]) {
-      if (typeof value === typeofChecks[i][1])
-        return;
-      throw new Match.Error("Expected " + typeofChecks[i][1] + ", got " +
-                            typeof value);
-    }
-  }
-  if (pattern === null) {
-    if (value === null)
-      return;
-    throw new Match.Error("Expected null, got " + EJSON.stringify(value));
-  }
-
-  // Strings, numbers, and booleans match literally. Goes well with Match.OneOf.
-  if (typeof pattern === "string" || typeof pattern === "number" || typeof pattern === "boolean") {
-    if (value === pattern)
-      return;
-    throw new Match.Error("Expected " + pattern + ", got " +
-                          EJSON.stringify(value));
-  }
-
-  // Match.Integer is special type encoded with array
-  if (pattern === Match.Integer) {
-    // There is no consistent and reliable way to check if variable is a 64-bit
-    // integer. One of the popular solutions is to get reminder of division by 1
-    // but this method fails on really large floats with big precision.
-    // E.g.: 1.348192308491824e+23 % 1 === 0 in V8
-    // Bitwise operators work consistantly but always cast variable to 32-bit
-    // signed integer according to JavaScript specs.
-    if (typeof value === "number" && (value | 0) === value)
-      return
-    throw new Match.Error("Expected Integer, got "
-                + (value instanceof Object ? EJSON.stringify(value) : value));
-  }
-
-  // "Object" is shorthand for Match.ObjectIncluding({});
-  if (pattern === Object)
-    pattern = Match.ObjectIncluding({});
-
-  // Array (checked AFTER Any, which is implemented as an Array).
-  if (pattern instanceof Array) {
-    if (pattern.length !== 1)
-      throw Error("Bad pattern: arrays must have one type element" +
-                  EJSON.stringify(pattern));
-    if (!_.isArray(value) && !_.isArguments(value)) {
-      throw new Match.Error("Expected array, got " + EJSON.stringify(value));
-    }
-
-    _.each(value, function (valueElement, index) {
-      try {
-        checkSubtree(valueElement, pattern[0]);
-      } catch (err) {
-        if (err instanceof Match.Error) {
-          err.path = _prependPath(index, err.path);
-        }
-        throw err;
-      }
-    });
-    return;
-  }
-
-  // Arbitrary validation checks. The condition can return false or throw a
-  // Match.Error (ie, it can internally use check()) to fail.
-  if (pattern instanceof Where) {
-    if (pattern.condition(value))
-      return;
-    // XXX this error is terrible
-    throw new Match.Error("Failed Match.Where validation");
-  }
-
-
-  if (pattern instanceof Optional)
-    pattern = Match.OneOf(undefined, pattern.pattern);
-
-  if (pattern instanceof OneOf) {
-    for (var i = 0; i < pattern.choices.length; ++i) {
-      try {
-        checkSubtree(value, pattern.choices[i]);
-        // No error? Yay, return.
-        return;
-      } catch (err) {
-        // Other errors should be thrown. Match errors just mean try another
-        // choice.
-        if (!(err instanceof Match.Error))
-          throw err;
-      }
-    }
-    // XXX this error is terrible
-    throw new Match.Error("Failed Match.OneOf or Match.Optional validation");
-  }
-
-  // A function that isn't something we special-case is assumed to be a
-  // constructor.
-  if (pattern instanceof Function) {
-    if (value instanceof pattern)
-      return;
-    throw new Match.Error("Expected " + (pattern.name ||
-                                         "particular constructor"));
-  }
-
-  var unknownKeysAllowed = false;
-  var unknownKeyPattern;
-  if (pattern instanceof ObjectIncluding) {
-    unknownKeysAllowed = true;
-    pattern = pattern.pattern;
-  }
-  if (pattern instanceof ObjectWithValues) {
-    unknownKeysAllowed = true;
-    unknownKeyPattern = [pattern.pattern];
-    pattern = {};  // no required keys
-  }
-
-  if (typeof pattern !== "object")
-    throw Error("Bad pattern: unknown pattern type");
-
-  // An object, with required and optional keys. Note that this does NOT do
-  // structural matches against objects of special types that happen to match
-  // the pattern: this really needs to be a plain old {Object}!
-  if (typeof value !== 'object')
-    throw new Match.Error("Expected object, got " + typeof value);
-  if (value === null)
-    throw new Match.Error("Expected object, got null");
-  if (value.constructor !== Object)
-    throw new Match.Error("Expected plain object");
-
-  var requiredPatterns = {};
-  var optionalPatterns = {};
-  _.each(pattern, function (subPattern, key) {
-    if (subPattern instanceof Optional)
-      optionalPatterns[key] = subPattern.pattern;
-    else
-      requiredPatterns[key] = subPattern;
-  });
-
-  _.each(value, function (subValue, key) {
-    try {
-      if (_.has(requiredPatterns, key)) {
-        checkSubtree(subValue, requiredPatterns[key]);
-        delete requiredPatterns[key];
-      } else if (_.has(optionalPatterns, key)) {
-        checkSubtree(subValue, optionalPatterns[key]);
-      } else {
-        if (!unknownKeysAllowed)
-          throw new Match.Error("Unknown key");
-        if (unknownKeyPattern) {
-          checkSubtree(subValue, unknownKeyPattern[0]);
-        }
-      }
-    } catch (err) {
-      if (err instanceof Match.Error)
-        err.path = _prependPath(key, err.path);
-      throw err;
-    }
-  });
-
-  _.each(requiredPatterns, function (subPattern, key) {
-    throw new Match.Error("Missing key '" + key + "'");
-  });
-};
 
 var ArgumentChecker = function (args, description) {
   var self = this;
@@ -380,3 +349,4 @@ var _prependPath = function (key, base) {
   return key + base;
 };
 
+module.exports = Match;

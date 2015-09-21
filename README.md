@@ -1,25 +1,34 @@
-# check
 
-`check` is a lightweight package for argument checking and general pattern matching. Use it like this:
+# check v1.0.6 [![experimental](http://badges.github.io/stability-badges/dist/experimental.svg)](http://github.com/badges/stability-badges)
 
-```
-Meteor.publish("chats-in-room", function (roomId) {
-  // Make sure roomId is a string, not an arbitrary mongo selector object.
-  check(roomId, String);
-  return Chats.find({room: roomId});
-});
+This package is stripped from [meteor/check](https://atmospherejs.com/meteor/check) and made compatible with [React Native](https://github.com/facebook/react-native).
 
-Meteor.methods({addChat: function (roomId, message) {
-  check(roomId, String);
-  check(message, {
-    text: String,
-    timestamp: Date,
-    // Optional, but if present must be an array of strings.
-    tags: Match.Optional([String])
-  });
+**Note:** This package is only for client-side usage.
 
-  // ... do something with the message ...
-}});
+&nbsp;
+
+## usage
+
+```js
+var check = require('check');
+
+// Throw if 'someVar' isnt a Number type
+check(someVar, Number);
 ```
 
-For more details see the [`check` section](http://docs.meteor.com/#check_package) of the Meteor docs.
+More functionality is exposed with the `Match` singleton.
+
+```js
+var Match = require('check/match');
+
+// Throw if 'someVar' isnt a String type (or undefined)
+check(someVar, Match.Optional(String));
+```
+
+Learn more [here](https://atmospherejs.com/meteor/check).
+
+&nbsp;
+
+## notes
+
+- Heterogenous arrays are not supported.
